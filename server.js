@@ -3,233 +3,269 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = process.env.PORT || 3000;
 const HOST = "0.0.0.0";
+const RENDER_API = "https://api.render.com/v1";
 
-const ROOT = __dirname;
-const PUBLIC_DIR = path.join(ROOT, "public");
-const DATA_DIR = path.join(ROOT, "data");
+const DATA_DIR = path.join(__dirname, "data");
 const DATA_FILE = path.join(DATA_DIR, "projects.json");
+const PUBLIC_DIR = path.join(__dirname, "public");
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-
-if (!fs.existsSync(DATA_FILE)) {
-  fs.writeFileSync(DATA_FILE, "[]", "utf8");
-}
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, "[]");
 
 function readProjects() {
-  try {
-    const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-    return Array.isArray(data) ? data : [];
-  } catch {
-    return [];
-  }
+    try {
+        return JSON.parse(fs.readFileSync(DATA_FILE, "utf8") || "[]");
+    } catch {
+        return [];
+    }
 }
 
 function saveProjects(projects) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(projects, null, 2), "utf8");
+    fs.writeFileSync(DATA_FILE, JSON.stringify(projects, null, 2));
 }
 
-function send(res, status, data) {
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store"
-  });
-  res.end(JSON.stringify(data));
+function sendJSON(res, status, data) {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(data));
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
+function getBody(req) {
+    return new Promise((resolve, reject) => {
+        let body = "";
+        req.on("data", chunk => body += chunk);
+        req.on("end", () => {
+            try {
+                resolve(JSON.parse(body || "{}"));
+            } catch {
+                reject(new Error("Invalid JSON"));
+            }
+        });
+        req.on("error", reject);
+    });
+}
 
-    req.on("data", chunk => {
-      body += chunk;
+async function renderRequest(endpoint, method = "GET", body) {
+    const key = process.env.RENDER_API_KEY;
 
-      if (body.length > 1000000) {
-        reject(new Error("Request too large"));
-        req.destroy();
-      }
+    if (!key) throw new Error("RENDER_API_KEY is missing in Render environment");
+
+    const response = await fetch(RENDER_API + endpoint, {
+        method,
+        headers: {
+            "Authorization": `Bearer ${key}`,
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        },
+        ...(body ? { body: JSON.stringify(body) } : {})
     });
 
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(body || "{}"));
-      } catch {
-        reject(new Error("Invalid JSON"));
-      }
-    });
+    const data = await response.json();
 
-    req.on("error", reject);
-  });
-}
-
-function validateProject(input) {
-  const name = String(input.name || "").trim();
-  const runtime = String(input.runtime || "").trim();
-  let repository = String(input.repository || "").trim();
-
-  if (name.length < 2 || name.length > 60) {
-    return "Project name must be 2-60 characters.";
-  }
-
-  if (!["Node.js", "Python", "Java", "C++"].includes(runtime)) {
-    return "Invalid runtime.";
-  }
-
-  try {
-    const url = new URL(repository);
-
-    if (url.protocol !== "https:" || url.hostname !== "github.com") {
-      return "Enter a valid GitHub URL.";
+    if (!response.ok) {
+        throw new Error(data.message || data.error || `Render API error: ${response.status}`);
     }
 
-    const parts = url.pathname.split("/").filter(Boolean);
+    return data;
+}
+
+async function deployProject(body) {
+    const repo = String(body.repository || "").trim();
+    const projectName = String(body.name || "cloudorbit-app").trim();
+
+    let repoUrl;
+
+    try {
+        repoUrl = new URL(repo);
+    } catch {
+        throw new Error("Valid GitHub repository URL required");
+    }
+
+    if (repoUrl.hostname !== "github.com") {
+        throw new Error("Only GitHub repository URLs are supported");
+    }
+
+    const parts = repoUrl.pathname.split("/").filter(Boolean);
 
     if (parts.length < 2) {
-      return "Repository owner and name are required.";
+        throw new Error("Invalid GitHub repository URL");
     }
 
-    repository = `https://github.com/${parts[0]}/${parts[1].replace(/\.git$/i, "")}`;
-  } catch {
-    return "Invalid GitHub repository URL.";
-  }
+    const cleanRepo = `https://github.com/${parts[0]}/${parts[1].replace(/\.git$/, "")}`;
 
-  return { name, runtime, repository };
+    const runtime = String(body.runtime || "Node.js");
+
+    let renderRuntime;
+    let buildCommand;
+    let startCommand;
+
+    if (runtime.toLowerCase().includes("node")) {
+        renderRuntime = "node";
+        buildCommand = "npm install";
+        startCommand = "npm start";
+    } else if (runtime.toLowerCase().includes("python")) {
+        renderRuntime = "python";
+        buildCommand = "pip install -r requirements.txt";
+        startCommand = "gunicorn app:app";
+    } else {
+        throw new Error("Currently supported runtimes: Node.js and Python");
+    }
+
+    // Find CloudOrbit workspace ID from its existing Render service
+    const services = await renderRequest("/services?limit=100");
+    const existing = services
+        .map(item => item.service || item)
+        .find(service => service.name === "CloudOrbit");
+
+    if (!existing || !existing.ownerId) {
+        throw new Error("Could not find CloudOrbit workspace. Check Render API permissions.");
+    }
+
+    const uniqueName =
+        projectName.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "")
+        + "-" + Date.now().toString().slice(-6);
+
+    const result = await renderRequest("/services", "POST", {
+        type: "web_service",
+        name: uniqueName,
+        ownerId: existing.ownerId,
+        repo: cleanRepo,
+        branch: body.branch || "main",
+        autoDeployTrigger: "commit",
+        serviceDetails: {
+            runtime: renderRuntime,
+            region: "singapore",
+            plan: "free",
+            buildCommand,
+            startCommand
+        }
+    });
+
+    return result;
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
 
-  try {
-    if (req.method === "GET" && url.pathname === "/api/health") {
-      return send(res, 200, {
-        ok: true,
-        service: "CloudOrbit API",
-        status: "online"
-      });
+    if (req.method === "GET" && pathname === "/api/health") {
+        return sendJSON(res, 200, {
+            status: "online",
+            message: "CloudOrbit API is running"
+        });
     }
 
-    if (req.method === "GET" && url.pathname === "/api/projects") {
-      return send(res, 200, {
-        projects: readProjects()
-      });
+    if (req.method === "GET" && pathname === "/api/projects") {
+        return sendJSON(res, 200, { projects: readProjects() });
     }
 
-    if (req.method === "POST" && url.pathname === "/api/projects") {
-      const body = await readBody(req);
-      const valid = validateProject(body);
+    if (req.method === "POST" && pathname === "/api/projects") {
+        try {
+            const body = await getBody(req);
 
-      if (typeof valid === "string") {
-        return send(res, 400, { error: valid });
-      }
+            if (!body.name || !body.runtime) {
+                return sendJSON(res, 400, { error: "Name and runtime are required" });
+            }
 
-      const projects = readProjects();
+            const projects = readProjects();
 
-      const project = {
-        id: `co_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        ...valid,
-        status: "Configuration prepared",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
+            const project = {
+                id: "co_" + Date.now(),
+                name: body.name,
+                runtime: body.runtime,
+                repository: body.repository || "",
+                status: "Configuration prepared",
+                createdAt: new Date().toISOString()
+            };
 
-      projects.unshift(project);
-      saveProjects(projects);
+            projects.unshift(project);
+            saveProjects(projects);
 
-      return send(res, 201, { project });
+            return sendJSON(res, 201, { message: "Project saved", project });
+        } catch (error) {
+            return sendJSON(res, 400, { error: error.message });
+        }
     }
 
-    const match = url.pathname.match(/^\/api\/projects\/([^/]+)$/);
+    // Create and deploy a GitHub project on Render
+    if (req.method === "POST" && pathname === "/api/deploy") {
+        try {
+            const body = await getBody(req);
+            const result = await deployProject(body);
+            const service = result.service || result;
 
-    if (match && req.method === "PUT") {
-      const id = decodeURIComponent(match[1]);
-      const body = await readBody(req);
-      const valid = validateProject(body);
+            const projects = readProjects();
+            const project = {
+                id: "co_" + Date.now(),
+                name: body.name,
+                repository: body.repository,
+                runtime: body.runtime || "Node.js",
+                status: "Deployment requested",
+                renderServiceId: service.id,
+                renderDashboardUrl: service.dashboardUrl,
+                createdAt: new Date().toISOString()
+            };
 
-      if (typeof valid === "string") {
-        return send(res, 400, { error: valid });
-      }
+            projects.unshift(project);
+            saveProjects(projects);
 
-      const projects = readProjects();
-      const index = projects.findIndex(p => p.id === id);
-
-      if (index === -1) {
-        return send(res, 404, { error: "Project not found." });
-      }
-
-      projects[index] = {
-        ...projects[index],
-        ...valid,
-        updatedAt: new Date().toISOString()
-      };
-
-      saveProjects(projects);
-      return send(res, 200, { project: projects[index] });
+            return sendJSON(res, 201, {
+                message: "Render deployment created",
+                project,
+                dashboardUrl: service.dashboardUrl,
+                serviceId: service.id
+            });
+        } catch (error) {
+            return sendJSON(res, 400, { error: error.message });
+        }
     }
 
-    if (match && req.method === "DELETE") {
-      const id = decodeURIComponent(match[1]);
-      const projects = readProjects();
-      const updated = projects.filter(p => p.id !== id);
+    if (req.method === "DELETE" && pathname.startsWith("/api/projects/")) {
+        const id = pathname.split("/").pop();
+        const projects = readProjects();
+        const updated = projects.filter(p => p.id !== id);
 
-      if (updated.length === projects.length) {
-        return send(res, 404, { error: "Project not found." });
-      }
+        if (updated.length === projects.length) {
+            return sendJSON(res, 404, { error: "Project not found" });
+        }
 
-      saveProjects(updated);
-      return send(res, 200, { ok: true });
+        saveProjects(updated);
+        return sendJSON(res, 200, { message: "Project deleted" });
     }
 
-    if (url.pathname.startsWith("/api/")) {
-      return send(res, 404, { error: "API endpoint not found." });
+    if (req.method === "GET") {
+        const requested = pathname === "/" ? "/index.html" : pathname;
+        const file = path.resolve(PUBLIC_DIR, "." + requested);
+
+        if (!file.startsWith(PUBLIC_DIR + path.sep) &&
+            file !== path.join(PUBLIC_DIR, "index.html")) {
+            res.writeHead(403);
+            return res.end("Forbidden");
+        }
+
+        return fs.readFile(file, (err, data) => {
+            if (err) {
+                res.writeHead(404);
+                return res.end("File not found");
+            }
+
+            const types = {
+                ".html": "text/html",
+                ".css": "text/css",
+                ".js": "application/javascript",
+                ".json": "application/json"
+            };
+
+            res.writeHead(200, {
+                "Content-Type": types[path.extname(file)] || "application/octet-stream"
+            });
+            res.end(data);
+        });
     }
 
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      return send(res, 405, { error: "Method not allowed." });
-    }
-
-    const requested = url.pathname === "/"
-      ? "index.html"
-      : decodeURIComponent(url.pathname).replace(/^\/+/, "");
-
-    const filePath = path.resolve(PUBLIC_DIR, requested);
-
-    if (
-      !filePath.startsWith(PUBLIC_DIR + path.sep) &&
-      filePath !== path.join(PUBLIC_DIR, "index.html")
-    ) {
-      res.writeHead(403);
-      return res.end("Forbidden");
-    }
-
-    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
-      res.writeHead(404);
-      return res.end("Page not found");
-    }
-
-    const types = {
-      ".html": "text/html; charset=utf-8",
-      ".css": "text/css; charset=utf-8",
-      ".js": "text/javascript; charset=utf-8",
-      ".png": "image/png",
-      ".svg": "image/svg+xml"
-    };
-
-    res.writeHead(200, {
-      "Content-Type": types[path.extname(filePath)] || "application/octet-stream"
-    });
-
-    if (req.method === "HEAD") return res.end();
-
-    fs.createReadStream(filePath).pipe(res);
-
-  } catch (error) {
-    if (!res.headersSent) {
-      send(res, 500, { error: error.message || "Internal server error." });
-    }
-  }
+    return sendJSON(res, 404, { error: "Endpoint not found" });
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`CloudOrbit running on ${HOST}:${PORT}`);
+    console.log(`CloudOrbit running on ${HOST}:${PORT}`);
 });
