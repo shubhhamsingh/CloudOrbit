@@ -1,0 +1,12 @@
+{
+  "name": "cloudorbit",
+  "version": "1.0.0",
+  "description": "A cloud deployment platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["cloud", "deployment", "devops"],
+  "author": "Shubham Kumar Singh",
+  "license": "MIT"
+}
